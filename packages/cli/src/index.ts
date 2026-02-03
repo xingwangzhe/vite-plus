@@ -1,5 +1,6 @@
-import { defineConfig } from '@voidzero-dev/vite-plus-test/config';
+import { type Plugin as VitestPlugin } from '@voidzero-dev/vite-plus-test/config';
 
+import { defineConfig } from './define-config.js';
 import type { LibUserConfig } from './lib';
 import type { FormatOptions } from './oxfmt-config';
 import type { OxlintConfig } from './oxlint-config';
@@ -17,6 +18,12 @@ declare module '@voidzero-dev/vite-plus-core' {
     lib?: LibUserConfig | LibUserConfig[];
 
     tasks?: Tasks;
+
+    // temporary solution to load plugins lazily
+    // We need to support this in the upstream vite
+    lazy?: () => Promise<{
+      plugins?: VitestPlugin[];
+    }>;
   }
 }
 

@@ -16,9 +16,10 @@
  */
 
 import { existsSync, globSync, readdirSync, statSync } from 'node:fs';
-import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
 
 import { createBuildCommand, NapiCli } from '@napi-rs/cli';
 import { format } from 'oxfmt';
@@ -29,25 +30,36 @@ import {
   parseJsonSourceFileConfigFileContent,
   readJsonConfigFile,
   sys,
+  ModuleKind,
 } from 'typescript';
 
 const projectDir = dirname(fileURLToPath(import.meta.url));
 const TEST_PACKAGE_NAME = '@voidzero-dev/vite-plus-test';
 const CORE_PACKAGE_NAME = '@voidzero-dev/vite-plus-core';
 
-const skipNative = process.argv.includes('--skip-native');
-const skipTs = process.argv.includes('--skip-ts');
+const {
+  values: { ['skip-native']: skipNative, ['skip-ts']: skipTs },
+} = parseArgs({
+  options: {
+    ['skip-native']: { type: 'boolean', default: false },
+    ['skip-ts']: { type: 'boolean', default: false },
+  },
+  strict: false,
+});
+
 // Filter out custom flags before passing to NAPI CLI
 const napiArgs = process.argv
   .slice(2)
   .filter((arg) => arg !== '--skip-native' && arg !== '--skip-ts');
 
+if (!skipTs) {
+  await buildCli();
+}
 // Build native first - TypeScript may depend on the generated binding types
 if (!skipNative) {
   await buildNapiBinding();
 }
 if (!skipTs) {
-  await buildCli();
   await syncCorePackageExports();
   await syncTestPackageExports();
 }
@@ -106,11 +118,38 @@ async function buildCli() {
     sys,
     projectDir,
   );
+
   const options = {
     ...initialOptions,
     noEmit: false,
     outDir: join(projectDir, 'dist'),
   };
+
+  const cjsHost = createCompilerHost({
+    ...options,
+    module: ModuleKind.CommonJS,
+  });
+
+  const cjsProgram = createProgram({
+    rootNames: ['src/define-config.ts'],
+    options: {
+      ...options,
+      module: ModuleKind.CommonJS,
+    },
+    host: cjsHost,
+  });
+
+  const { diagnostics: cjsDiagnostics } = cjsProgram.emit();
+
+  if (cjsDiagnostics.length > 0) {
+    console.error(formatDiagnostics(cjsDiagnostics, cjsHost));
+    process.exit(1);
+  }
+  await rename(
+    join(projectDir, 'dist/define-config.js'),
+    join(projectDir, 'dist/define-config.cjs'),
+  );
+
   const host = createCompilerHost(options);
 
   const program = createProgram({
