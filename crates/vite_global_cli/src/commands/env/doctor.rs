@@ -11,6 +11,49 @@ use super::config::{
 };
 use crate::error::Error;
 
+/// IDE-relevant profile files that GUI-launched applications can see.
+/// GUI apps don't run through an interactive shell, so only login/environment
+/// files reliably affect them.
+/// - macOS: `.zshenv` is sourced for all zsh invocations (including IDE env resolution)
+/// - Linux: `.profile` is sourced by X11 display managers; `.zshenv` covers Wayland + zsh
+#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const IDE_PROFILES: &[(&str, bool)] = &[(".zshenv", false), (".profile", false)];
+
+#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+const IDE_PROFILES: &[(&str, bool)] = &[(".profile", false), (".zshenv", false)];
+
+#[cfg(not(windows))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const IDE_PROFILES: &[(&str, bool)] = &[(".profile", false)];
+
+/// All shell profile files that interactive terminal sessions may source.
+/// This matches the files that `install.sh` writes to and `vp implode` cleans.
+/// The bool flag indicates whether the file uses fish-style sourcing (`env.fish`
+/// instead of `env`).
+#[cfg(not(windows))]
+const ALL_SHELL_PROFILES: &[(&str, bool)] = &[
+    (".zshenv", false),
+    (".zshrc", false),
+    (".bash_profile", false),
+    (".bashrc", false),
+    (".profile", false),
+    (".config/fish/config.fish", true),
+    (".config/fish/conf.d/vite-plus.fish", true),
+];
+
+/// Result of checking profile files for env sourcing.
+#[cfg(not(windows))]
+enum EnvSourcingStatus {
+    /// Found in an IDE-relevant profile (e.g., .zshenv, .profile).
+    IdeFound,
+    /// Found only in an interactive shell profile (e.g., .bashrc, .zshrc).
+    ShellOnly,
+    /// Not found in any profile.
+    NotFound,
+}
+
 /// Known version managers that might conflict
 const KNOWN_VERSION_MANAGERS: &[(&str, &str)] = &[
     ("nvm", "NVM_DIR"),
@@ -22,7 +65,7 @@ const KNOWN_VERSION_MANAGERS: &[(&str, &str)] = &[
 ];
 
 /// Tools that should have shims
-const SHIM_TOOLS: &[&str] = &["node", "npm", "npx"];
+const SHIM_TOOLS: &[&str] = &["node", "npm", "npx", "vpx"];
 
 /// Column width for left-side keys in aligned output
 const KEY_WIDTH: usize = 18;
@@ -74,7 +117,11 @@ pub async fn execute(cwd: AbsolutePathBuf) -> Result<ExitStatus, Error> {
     // Section: Configuration
     print_section("Configuration");
     check_shim_mode().await;
-    let ide_env_found = check_ide_integration();
+
+    // Check env sourcing: IDE-relevant profiles first, then all shell profiles
+    #[cfg(not(windows))]
+    let env_status = check_env_sourcing();
+
     check_session_override();
 
     // Section: PATH
@@ -88,10 +135,17 @@ pub async fn execute(cwd: AbsolutePathBuf) -> Result<ExitStatus, Error> {
     // Section: Conflicts (conditional)
     check_conflicts();
 
-    // Section: IDE Setup (conditional - only when env sourcing NOT found)
-    if !ide_env_found {
-        if let Ok(bin_dir) = get_bin_dir() {
-            print_ide_setup_guidance(&bin_dir);
+    // Section: IDE Setup (conditional - when env not found in IDE-relevant profiles)
+    #[cfg(not(windows))]
+    {
+        match &env_status {
+            EnvSourcingStatus::IdeFound => {} // All good, no guidance needed
+            EnvSourcingStatus::ShellOnly | EnvSourcingStatus::NotFound => {
+                // Show IDE setup guidance when env is not in IDE-relevant profiles
+                if let Ok(bin_dir) = get_bin_dir() {
+                    print_ide_setup_guidance(&bin_dir);
+                }
+            }
         }
     }
 
@@ -234,46 +288,56 @@ async fn check_shim_mode() {
     }
 }
 
-/// Check profile files for IDE integration and return whether env sourcing was found.
-fn check_ide_integration() -> bool {
-    // On Windows, IDE PATH is handled by System Environment Variables
-    #[cfg(windows)]
-    {
-        return true;
-    }
+/// Check profile files for env sourcing and classify where it was found.
+///
+/// Tries IDE-relevant profiles first, then falls back to all shell profiles.
+/// Returns `EnvSourcingStatus` indicating where (if anywhere) the sourcing was found.
+#[cfg(not(windows))]
+fn check_env_sourcing() -> EnvSourcingStatus {
+    let bin_dir = match get_bin_dir() {
+        Ok(d) => d,
+        Err(_) => return EnvSourcingStatus::NotFound,
+    };
 
-    #[cfg(not(windows))]
-    {
-        let bin_dir = match get_bin_dir() {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-
-        let home_path = bin_dir
-            .parent()
-            .map(|p| p.as_path().display().to_string())
-            .unwrap_or_else(|| bin_dir.as_path().display().to_string());
-        let home_path = if let Ok(home_dir) = std::env::var("HOME") {
-            if let Some(suffix) = home_path.strip_prefix(&home_dir) {
-                format!("$HOME{suffix}")
-            } else {
-                home_path
-            }
+    let home_path = bin_dir
+        .parent()
+        .map(|p| p.as_path().display().to_string())
+        .unwrap_or_else(|| bin_dir.as_path().display().to_string());
+    let home_path = if let Ok(home_dir) = std::env::var("HOME") {
+        if let Some(suffix) = home_path.strip_prefix(&home_dir) {
+            format!("$HOME{suffix}")
         } else {
             home_path
-        };
-
-        if let Some(file) = check_profile_files(&home_path) {
-            print_check(
-                &output::CHECK.green().to_string(),
-                "IDE integration",
-                &format!("env sourced in {file}"),
-            );
-            true
-        } else {
-            false
         }
+    } else {
+        home_path
+    };
+
+    // First: check IDE-relevant profiles (login/environment files visible to GUI apps)
+    if let Some(file) = check_profile_files(&home_path, IDE_PROFILES) {
+        print_check(
+            &output::CHECK.green().to_string(),
+            "IDE integration",
+            &format!("env sourced in {file}"),
+        );
+        return EnvSourcingStatus::IdeFound;
     }
+
+    // Second: check all shell profiles (interactive terminal sessions)
+    if let Some(file) = check_profile_files(&home_path, ALL_SHELL_PROFILES) {
+        print_check(
+            &output::WARN_SIGN.yellow().to_string(),
+            "IDE integration",
+            &format!(
+                "{} {}",
+                format!("env sourced in {file}").yellow(),
+                "(may not be visible to GUI apps)".dimmed(),
+            ),
+        );
+        return EnvSourcingStatus::ShellOnly;
+    }
+
+    EnvSourcingStatus::NotFound
 }
 
 /// Find system Node.js, skipping vite-plus bin directory and any
@@ -441,37 +505,68 @@ fn print_path_fix(bin_dir: &vite_path::AbsolutePath) {
     }
 }
 
-/// Check profile files for vite-plus env sourcing line.
+/// Search for vite-plus env sourcing line in the given profile files.
 ///
-/// Returns `Some(display_path)` if any known profile file contains a reference
+/// Each entry in `profile_files` is `(filename, is_fish)`. When `is_fish` is true,
+/// searches for the `env.fish` pattern instead of `env`.
+///
+/// Returns `Some(display_path)` if any profile file contains a reference
 /// to the vite-plus env file, `None` otherwise.
 #[cfg(not(windows))]
-fn check_profile_files(vite_plus_home: &str) -> Option<String> {
+fn check_profile_files(vite_plus_home: &str, profile_files: &[(&str, bool)]) -> Option<String> {
     let home_dir = std::env::var("HOME").ok()?;
 
-    // Build candidate strings to search for: both $HOME/... and /absolute/...
-    let env_suffix = "/env";
-    let mut search_strings = vec![format!("{vite_plus_home}{env_suffix}")];
-    // If vite_plus_home uses $HOME prefix, also check the expanded absolute form
-    if let Some(suffix) = vite_plus_home.strip_prefix("$HOME") {
-        search_strings.push(format!("{home_dir}{suffix}{env_suffix}"));
-    }
-
-    #[cfg(target_os = "macos")]
-    let profile_files: &[&str] = &[".zshenv", ".profile"];
-
-    #[cfg(target_os = "linux")]
-    let profile_files: &[&str] = &[".profile"];
-
-    // Fallback for other Unix platforms
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let profile_files: &[&str] = &[".profile"];
-
-    for file in profile_files {
+    for &(file, is_fish) in profile_files {
         let full_path = format!("{home_dir}/{file}");
         if let Ok(content) = std::fs::read_to_string(&full_path) {
+            // Build candidate strings: both $HOME/... and /absolute/...
+            let env_suffix = if is_fish { "/env.fish" } else { "/env" };
+            let mut search_strings = vec![format!("{vite_plus_home}{env_suffix}")];
+            if let Some(suffix) = vite_plus_home.strip_prefix("$HOME") {
+                search_strings.push(format!("{home_dir}{suffix}{env_suffix}"));
+            }
+
             if search_strings.iter().any(|s| content.contains(s)) {
                 return Some(format!("~/{file}"));
+            }
+        }
+    }
+
+    // If ZDOTDIR is set and differs from $HOME, also check $ZDOTDIR/.zshenv and .zshrc
+    if let Ok(zdotdir) = std::env::var("ZDOTDIR") {
+        if !zdotdir.is_empty() && zdotdir != home_dir {
+            let env_suffix = "/env";
+            let mut search_strings = vec![format!("{vite_plus_home}{env_suffix}")];
+            if let Some(suffix) = vite_plus_home.strip_prefix("$HOME") {
+                search_strings.push(format!("{home_dir}{suffix}{env_suffix}"));
+            }
+
+            for file in [".zshenv", ".zshrc"] {
+                let path = format!("{zdotdir}/{file}");
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if search_strings.iter().any(|s| content.contains(s)) {
+                        return Some(abbreviate_home(&path));
+                    }
+                }
+            }
+        }
+    }
+
+    // If XDG_CONFIG_HOME is set and differs from default, also check fish conf.d
+    if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME") {
+        let default_config = format!("{home_dir}/.config");
+        if !xdg_config.is_empty() && xdg_config != default_config {
+            let fish_suffix = "/env.fish";
+            let mut search_strings = vec![format!("{vite_plus_home}{fish_suffix}")];
+            if let Some(suffix) = vite_plus_home.strip_prefix("$HOME") {
+                search_strings.push(format!("{home_dir}{suffix}{fish_suffix}"));
+            }
+
+            let path = format!("{xdg_config}/fish/conf.d/vite-plus.fish");
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if search_strings.iter().any(|s| content.contains(s)) {
+                    return Some(abbreviate_home(&path));
+                }
             }
         }
     }
@@ -480,61 +575,53 @@ fn check_profile_files(vite_plus_home: &str) -> Option<String> {
 }
 
 /// Print IDE setup guidance for GUI applications.
+#[cfg(not(windows))]
 fn print_ide_setup_guidance(bin_dir: &vite_path::AbsolutePath) {
-    // On Windows, IDE PATH is handled by System Environment Variables (covered by check_path)
-    #[cfg(windows)]
-    {
-        let _ = bin_dir;
-    }
-
-    #[cfg(not(windows))]
-    {
-        // Derive vite_plus_home display path from bin_dir.parent(), using $HOME prefix
-        let home_path = bin_dir
-            .parent()
-            .map(|p| p.as_path().display().to_string())
-            .unwrap_or_else(|| bin_dir.as_path().display().to_string());
-        let home_path = if let Ok(home_dir) = std::env::var("HOME") {
-            if let Some(suffix) = home_path.strip_prefix(&home_dir) {
-                format!("$HOME{suffix}")
-            } else {
-                home_path
-            }
+    // Derive vite_plus_home display path from bin_dir.parent(), using $HOME prefix
+    let home_path = bin_dir
+        .parent()
+        .map(|p| p.as_path().display().to_string())
+        .unwrap_or_else(|| bin_dir.as_path().display().to_string());
+    let home_path = if let Ok(home_dir) = std::env::var("HOME") {
+        if let Some(suffix) = home_path.strip_prefix(&home_dir) {
+            format!("$HOME{suffix}")
         } else {
             home_path
-        };
-
-        print_section("IDE Setup");
-        print_check(
-            &output::WARN_SIGN.yellow().to_string(),
-            "",
-            &"GUI applications may not see shell PATH changes.".yellow().to_string(),
-        );
-        println!();
-
-        #[cfg(target_os = "macos")]
-        {
-            println!("  {}", "macOS:".dimmed());
-            println!("  {}", "Add to ~/.zshenv or ~/.profile:".dimmed());
-            println!("  . \"{home_path}/env\"");
-            println!("  {}", "Then restart your IDE to apply changes.".dimmed());
         }
+    } else {
+        home_path
+    };
 
-        #[cfg(target_os = "linux")]
-        {
-            println!("  {}", "Linux:".dimmed());
-            println!("  {}", "Add to ~/.profile:".dimmed());
-            println!("  . \"{home_path}/env\"");
-            println!("  {}", "Then log out and log back in for changes to take effect.".dimmed());
-        }
+    print_section("IDE Setup");
+    print_check(
+        &output::WARN_SIGN.yellow().to_string(),
+        "",
+        &"GUI applications may not see shell PATH changes.".yellow().to_string(),
+    );
+    println!();
 
-        // Fallback for other Unix platforms
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            println!("  {}", "Add to your shell profile:".dimmed());
-            println!("  . \"{home_path}/env\"");
-            println!("  {}", "Then restart your IDE to apply changes.".dimmed());
-        }
+    #[cfg(target_os = "macos")]
+    {
+        println!("  {}", "macOS:".dimmed());
+        println!("  {}", "Add to ~/.zshenv or ~/.profile:".dimmed());
+        println!("  . \"{home_path}/env\"");
+        println!("  {}", "Then restart your IDE to apply changes.".dimmed());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        println!("  {}", "Linux:".dimmed());
+        println!("  {}", "Add to ~/.profile:".dimmed());
+        println!("  . \"{home_path}/env\"");
+        println!("  {}", "Then log out and log back in for changes to take effect.".dimmed());
+    }
+
+    // Fallback for other Unix platforms
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        println!("  {}", "Add to your shell profile:".dimmed());
+        println!("  . \"{home_path}/env\"");
+        println!("  {}", "Then restart your IDE to apply changes.".dimmed());
     }
 }
 
@@ -765,5 +852,177 @@ mod tests {
             // Non-home path should be unchanged
             assert_eq!(abbreviate_home("/usr/local/bin"), "/usr/local/bin");
         }
+    }
+
+    /// Guard for env vars used by profile file tests.
+    #[cfg(not(windows))]
+    struct ProfileEnvGuard {
+        original_home: Option<std::ffi::OsString>,
+        original_zdotdir: Option<std::ffi::OsString>,
+        original_xdg_config: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(not(windows))]
+    impl ProfileEnvGuard {
+        fn new(
+            home: &std::path::Path,
+            zdotdir: Option<&std::path::Path>,
+            xdg_config: Option<&std::path::Path>,
+        ) -> Self {
+            let guard = Self {
+                original_home: std::env::var_os("HOME"),
+                original_zdotdir: std::env::var_os("ZDOTDIR"),
+                original_xdg_config: std::env::var_os("XDG_CONFIG_HOME"),
+            };
+            unsafe {
+                std::env::set_var("HOME", home);
+                match zdotdir {
+                    Some(v) => std::env::set_var("ZDOTDIR", v),
+                    None => std::env::remove_var("ZDOTDIR"),
+                }
+                match xdg_config {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            guard
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for ProfileEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.original_zdotdir {
+                    Some(v) => std::env::set_var("ZDOTDIR", v),
+                    None => std::env::remove_var("ZDOTDIR"),
+                }
+                match &self.original_xdg_config {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_check_profile_files_finds_zdotdir() {
+        let temp = TempDir::new().unwrap();
+        let fake_home = temp.path().join("home");
+        let zdotdir = temp.path().join("zdotdir");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&zdotdir).unwrap();
+
+        std::fs::write(zdotdir.join(".zshenv"), ". \"$HOME/.vite-plus/env\"\n").unwrap();
+
+        let _guard = ProfileEnvGuard::new(&fake_home, Some(&zdotdir), None);
+
+        // Pass an empty base list so only ZDOTDIR fallback is triggered
+        let result = check_profile_files("$HOME/.vite-plus", &[]);
+        assert!(result.is_some(), "Should find .zshenv in ZDOTDIR");
+        assert!(result.unwrap().ends_with(".zshenv"));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_check_profile_files_finds_xdg_fish() {
+        let temp = TempDir::new().unwrap();
+        let fake_home = temp.path().join("home");
+        let xdg_config = temp.path().join("xdg_config");
+        let fish_dir = xdg_config.join("fish/conf.d");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&fish_dir).unwrap();
+
+        std::fs::write(fish_dir.join("vite-plus.fish"), "source \"$HOME/.vite-plus/env.fish\"\n")
+            .unwrap();
+
+        let _guard = ProfileEnvGuard::new(&fake_home, None, Some(&xdg_config));
+
+        // Pass an empty base list so only XDG fallback is triggered
+        let result = check_profile_files("$HOME/.vite-plus", &[]);
+        assert!(result.is_some(), "Should find vite-plus.fish in XDG_CONFIG_HOME");
+        assert!(result.unwrap().contains("vite-plus.fish"));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_check_profile_files_finds_posix_env_in_bashrc() {
+        let temp = TempDir::new().unwrap();
+        let fake_home = temp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        std::fs::write(fake_home.join(".bashrc"), "# some config\n. \"$HOME/.vite-plus/env\"\n")
+            .unwrap();
+
+        let _guard = ProfileEnvGuard::new(&fake_home, None, None);
+
+        let result =
+            check_profile_files("$HOME/.vite-plus", &[(".bashrc", false), (".profile", false)]);
+        assert!(result.is_some(), "Should find env sourcing in .bashrc");
+        assert_eq!(result.unwrap(), "~/.bashrc");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_check_profile_files_finds_fish_env() {
+        let temp = TempDir::new().unwrap();
+        let fake_home = temp.path().join("home");
+        let fish_dir = fake_home.join(".config/fish");
+        std::fs::create_dir_all(&fish_dir).unwrap();
+
+        std::fs::write(fish_dir.join("config.fish"), "source \"$HOME/.vite-plus/env.fish\"\n")
+            .unwrap();
+
+        let _guard = ProfileEnvGuard::new(&fake_home, None, None);
+
+        let result = check_profile_files("$HOME/.vite-plus", &[(".config/fish/config.fish", true)]);
+        assert!(result.is_some(), "Should find env.fish sourcing in fish config");
+        assert_eq!(result.unwrap(), "~/.config/fish/config.fish");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_check_profile_files_returns_none_when_not_found() {
+        let temp = TempDir::new().unwrap();
+        let fake_home = temp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        // Create a .bashrc without vite-plus sourcing
+        std::fs::write(fake_home.join(".bashrc"), "# no vite-plus here\nexport FOO=bar\n").unwrap();
+
+        let _guard = ProfileEnvGuard::new(&fake_home, None, None);
+
+        let result =
+            check_profile_files("$HOME/.vite-plus", &[(".bashrc", false), (".profile", false)]);
+        assert!(result.is_none(), "Should return None when env sourcing not found");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_check_profile_files_finds_absolute_path() {
+        let temp = TempDir::new().unwrap();
+        let fake_home = temp.path().join("home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+
+        // Use absolute path form instead of $HOME
+        let abs_path = format!(". \"{}/home/.vite-plus/env\"\n", temp.path().display());
+        std::fs::write(fake_home.join(".zshenv"), &abs_path).unwrap();
+
+        let _guard = ProfileEnvGuard::new(&fake_home, None, None);
+
+        let result = check_profile_files("$HOME/.vite-plus", &[(".zshenv", false)]);
+        assert!(result.is_some(), "Should find absolute path form of env sourcing");
+        assert_eq!(result.unwrap(), "~/.zshenv");
     }
 }

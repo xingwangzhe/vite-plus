@@ -15,5 +15,9 @@ Tools:
   oxlint-tsgolint  v<semver>
   tsdown           v<semver>
 
+Environment:
+  Package manager  Not found
+  Node.js          Not found
+
 > test -f .node-version && echo 'FAIL: .node-version was created' || echo 'OK: no .node-version created'
 OK: no .node-version created

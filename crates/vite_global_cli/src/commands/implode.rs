@@ -7,21 +7,29 @@ use std::{
 
 use directories::BaseDirs;
 use owo_colors::OwoColorize;
-use vite_path::AbsolutePathBuf;
+use vite_path::{AbsolutePath, AbsolutePathBuf};
 use vite_shared::output;
 use vite_str::Str;
 
 use crate::{cli::exit_status, error::Error};
 
-/// All shell profile paths to check, with `is_fish` flag.
+/// All shell profile paths to check, with `is_snippet` flag.
 const SHELL_PROFILES: &[(&str, bool)] = &[
     (".zshenv", false),
     (".zshrc", false),
     (".bash_profile", false),
     (".bashrc", false),
     (".profile", false),
-    (".config/fish/config.fish", true),
+    (".config/fish/conf.d/vite-plus.fish", true),
 ];
+
+/// Abbreviate a path for display: replace `$HOME` prefix with `~`.
+fn abbreviate_home_path(path: &AbsolutePath, user_home: &AbsolutePath) -> Str {
+    match path.strip_prefix(user_home) {
+        Ok(Some(suffix)) => vite_str::format!("~/{suffix}"),
+        _ => Str::from(path.to_string()),
+    }
+}
 
 /// Comment marker written by the install script above the sourcing line.
 const VITE_PLUS_COMMENT: &str = "# Vite+ bin";
@@ -76,32 +84,75 @@ pub fn execute(yes: bool) -> Result<ExitStatus, Error> {
 
 /// A shell profile that contains Vite+ sourcing lines.
 struct AffectedProfile {
-    /// Display name (e.g. ".zshrc", ".config/fish/config.fish").
+    /// Display name (e.g. ".zshrc", ".config/fish/conf.d/vite-plus.fish").
     name: Str,
     /// Absolute path to the file.
     path: AbsolutePathBuf,
-    /// Whether this is a fish shell profile.
-    is_fish: bool,
-    /// File content read during detection (reused for cleaning).
-    content: Str,
+    kind: AffectedProfileKind,
+}
+
+// Indicating whether it's a snippet (remove file) or a main profile (remove lines).
+enum AffectedProfileKind {
+    // A snippet, uninstall would be as easy as removing the file
+    Snippet,
+    Main {
+        /// File content read during detection (reused for cleaning).
+        content: Str,
+    },
 }
 
 /// Collect shell profiles that contain Vite+ sourcing lines.
 /// Content is cached so we don't need to re-read during cleaning.
 fn collect_affected_profiles(user_home: &AbsolutePathBuf) -> Vec<AffectedProfile> {
     let mut affected = Vec::new();
-    for &(name, is_fish) in SHELL_PROFILES {
-        let path = user_home.join(name);
+
+    // Build full list of (display_name, path, is_snippet) from the base set
+    let mut profiles: Vec<(Str, AbsolutePathBuf, bool)> = SHELL_PROFILES
+        .iter()
+        .map(|&(name, is_snippet)| {
+            (vite_str::format!("~/{name}"), user_home.join(name), is_snippet)
+        })
+        .collect();
+
+    // If ZDOTDIR is set and differs from $HOME, also check there.
+    if let Ok(zdotdir) = std::env::var("ZDOTDIR")
+        && let Some(zdotdir_path) = AbsolutePathBuf::new(zdotdir.into())
+        && zdotdir_path != *user_home
+    {
+        for name in [".zshenv", ".zshrc"] {
+            let path = zdotdir_path.join(name);
+            let display = abbreviate_home_path(&path, user_home);
+            profiles.push((display, path, false));
+        }
+    }
+
+    // If XDG_CONFIG_HOME is set and differs from $HOME/.config, also check there.
+    if let Ok(xdg_config) = std::env::var("XDG_CONFIG_HOME")
+        && let Some(xdg_path) = AbsolutePathBuf::new(xdg_config.into())
+        && xdg_path != user_home.join(".config")
+    {
+        let path = xdg_path.join("fish/conf.d/vite-plus.fish");
+        let display = abbreviate_home_path(&path, user_home);
+        profiles.push((display, path, true));
+    }
+
+    for (name, path, is_snippet) in profiles {
+        // For snippets, check if the file exists only
+        if is_snippet {
+            if let Ok(true) = std::fs::exists(&path) {
+                affected.push(AffectedProfile { name, path, kind: AffectedProfileKind::Snippet })
+            }
+            continue;
+        }
         // Read directly — if the file doesn't exist, read_to_string returns Err
-        // which is_ok_and handles gracefully (no redundant exists() check).
+        // which .ok().filter() handles gracefully (no redundant exists() check).
         if let Some(content) =
-            std::fs::read_to_string(&path).ok().filter(|c| has_vite_plus_lines(c, is_fish))
+            std::fs::read_to_string(&path).ok().filter(|c| has_vite_plus_lines(c))
         {
             affected.push(AffectedProfile {
-                name: Str::from(name),
+                name,
                 path,
-                is_fish,
-                content: Str::from(content),
+                kind: AffectedProfileKind::Main { content: Str::from(content) },
             });
         }
     }
@@ -127,7 +178,7 @@ fn confirm_implode(
     if !affected_profiles.is_empty() {
         output::raw("  Shell profiles to clean:");
         for profile in affected_profiles {
-            output::raw(&vite_str::format!("    - ~/{}", profile.name));
+            output::raw(&vite_str::format!("    - {}", profile.name));
         }
     }
     output::raw("");
@@ -150,12 +201,22 @@ fn confirm_implode(
 /// Clean all affected shell profiles using cached content (no re-read).
 fn clean_affected_profiles(affected_profiles: &[AffectedProfile]) {
     for profile in affected_profiles {
-        let cleaned = remove_vite_plus_lines(&profile.content, profile.is_fish);
-        match std::fs::write(&profile.path, cleaned.as_bytes()) {
-            Ok(()) => output::success(&vite_str::format!("Cleaned ~/{}", profile.name)),
-            Err(e) => {
-                output::warn(&vite_str::format!("Failed to clean ~/{}: {e}", profile.name));
+        match &profile.kind {
+            AffectedProfileKind::Main { content } => {
+                let cleaned = remove_vite_plus_lines(content);
+                match std::fs::write(&profile.path, cleaned.as_bytes()) {
+                    Ok(()) => output::success(&vite_str::format!("Cleaned {}", profile.name)),
+                    Err(e) => {
+                        output::warn(&vite_str::format!("Failed to clean {}: {e}", profile.name));
+                    }
+                }
             }
+            AffectedProfileKind::Snippet => match std::fs::remove_file(&profile.path) {
+                Ok(()) => output::success(&vite_str::format!("Removed {}", profile.name)),
+                Err(e) => {
+                    output::warn(&vite_str::format!("Failed to remove {}: {e}", profile.name));
+                }
+            },
         }
     }
 }
@@ -242,14 +303,14 @@ fn spawn_deferred_delete(trash_path: &std::path::Path) -> std::io::Result<std::p
 }
 
 /// Check if file content contains Vite+ sourcing lines.
-fn has_vite_plus_lines(content: &str, is_fish: bool) -> bool {
-    let pattern = if is_fish { ".vite-plus/env.fish" } else { ".vite-plus/env\"" };
+fn has_vite_plus_lines(content: &str) -> bool {
+    let pattern = ".vite-plus/env\"";
     content.lines().any(|line| line.contains(pattern))
 }
 
 /// Remove Vite+ lines from content, returning the cleaned string.
-fn remove_vite_plus_lines(content: &str, is_fish: bool) -> Str {
-    let pattern = if is_fish { ".vite-plus/env.fish" } else { ".vite-plus/env\"" };
+fn remove_vite_plus_lines(content: &str) -> Str {
+    let pattern = ".vite-plus/env\"";
     let lines: Vec<&str> = content.lines().collect();
     let mut remove_indices = Vec::new();
 
@@ -309,40 +370,36 @@ fn remove_windows_path_entry(bin_path: &vite_path::AbsolutePath) -> std::io::Res
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
+    use serial_test::serial;
+
     use super::*;
 
     #[test]
     fn test_remove_vite_plus_lines_posix() {
         let content = "# existing config\nexport FOO=bar\n\n# Vite+ bin (https://viteplus.dev)\n. \"$HOME/.vite-plus/env\"\n";
-        let result = remove_vite_plus_lines(content, false);
+        let result = remove_vite_plus_lines(content);
         assert_eq!(&*result, "# existing config\nexport FOO=bar\n");
-    }
-
-    #[test]
-    fn test_remove_vite_plus_lines_fish() {
-        let content = "# fish config\nset -x FOO bar\n\n# Vite+ bin (https://viteplus.dev)\nsource \"$HOME/.vite-plus/env.fish\"\n";
-        let result = remove_vite_plus_lines(content, true);
-        assert_eq!(&*result, "# fish config\nset -x FOO bar\n");
     }
 
     #[test]
     fn test_remove_vite_plus_lines_no_match() {
         let content = "# just a normal config\nexport PATH=/usr/bin\n";
-        let result = remove_vite_plus_lines(content, false);
+        let result = remove_vite_plus_lines(content);
         assert_eq!(&*result, content);
     }
 
     #[test]
     fn test_remove_vite_plus_lines_absolute_path() {
         let content = "# existing\n. \"/home/user/.vite-plus/env\"\n";
-        let result = remove_vite_plus_lines(content, false);
+        let result = remove_vite_plus_lines(content);
         assert_eq!(&*result, "# existing\n");
     }
 
     #[test]
     fn test_remove_vite_plus_lines_preserves_surrounding() {
         let content = "# before\nexport A=1\n\n# Vite+ bin (https://viteplus.dev)\n. \"$HOME/.vite-plus/env\"\n# after\nexport B=2\n";
-        let result = remove_vite_plus_lines(content, false);
+        let result = remove_vite_plus_lines(content);
         assert_eq!(&*result, "# before\nexport A=1\n# after\nexport B=2\n");
     }
 
@@ -357,8 +414,7 @@ mod tests {
         let profiles = vec![AffectedProfile {
             name: Str::from(".zshrc"),
             path: profile_path.clone(),
-            is_fish: false,
-            content: Str::from(original),
+            kind: AffectedProfileKind::Main { content: Str::from(original) },
         }];
         clean_affected_profiles(&profiles);
 
@@ -399,6 +455,130 @@ mod tests {
         assert!(script.contains(r"C:\Users\test\.vite-plus.removing-1234"));
         assert!(script.contains("for /L %i in (1,1,10)"));
         assert!(script.contains("timeout /T 1 /NOBREAK"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_abbreviate_home_path() {
+        let home = AbsolutePathBuf::new("/home/user".into()).unwrap();
+        // Under home → ~/...
+        let under = AbsolutePathBuf::new("/home/user/.zshrc".into()).unwrap();
+        assert_eq!(&*abbreviate_home_path(&under, &home), "~/.zshrc");
+        // Outside home → absolute path as-is
+        let outside = AbsolutePathBuf::new("/opt/zdotdir/.zshenv".into()).unwrap();
+        assert_eq!(&*abbreviate_home_path(&outside, &home), "/opt/zdotdir/.zshenv");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_collect_affected_profiles() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = AbsolutePathBuf::new(temp_dir.path().to_path_buf()).unwrap();
+
+        // Clear ZDOTDIR/XDG_CONFIG_HOME so the test environment doesn't affect results
+        let _guard = ProfileEnvGuard::new(None, None);
+
+        // Main profile with vite-plus line
+        std::fs::write(home.join(".zshrc"), ". \"$HOME/.vite-plus/env\"\n").unwrap();
+        // Unrelated profile (should be ignored)
+        std::fs::write(home.join(".bashrc"), "export PATH=/usr/bin\n").unwrap();
+        // Snippet file (just needs to exist)
+        let fish_dir = home.join(".config/fish/conf.d");
+        std::fs::create_dir_all(&fish_dir).unwrap();
+        std::fs::write(fish_dir.join("vite-plus.fish"), "source ~/.vite-plus/env.fish\n").unwrap();
+
+        let profiles = collect_affected_profiles(&home);
+        assert_eq!(profiles.len(), 2);
+        assert!(matches!(&profiles[0].kind, AffectedProfileKind::Main { .. }));
+        assert!(matches!(&profiles[1].kind, AffectedProfileKind::Snippet));
+    }
+
+    /// Guard that saves and restores ZDOTDIR and XDG_CONFIG_HOME env vars.
+    #[cfg(not(windows))]
+    struct ProfileEnvGuard {
+        original_zdotdir: Option<std::ffi::OsString>,
+        original_xdg_config: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(not(windows))]
+    impl ProfileEnvGuard {
+        fn new(zdotdir: Option<&std::path::Path>, xdg_config: Option<&std::path::Path>) -> Self {
+            let guard = Self {
+                original_zdotdir: std::env::var_os("ZDOTDIR"),
+                original_xdg_config: std::env::var_os("XDG_CONFIG_HOME"),
+            };
+            unsafe {
+                match zdotdir {
+                    Some(v) => std::env::set_var("ZDOTDIR", v),
+                    None => std::env::remove_var("ZDOTDIR"),
+                }
+                match xdg_config {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+            guard
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for ProfileEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original_zdotdir {
+                    Some(v) => std::env::set_var("ZDOTDIR", v),
+                    None => std::env::remove_var("ZDOTDIR"),
+                }
+                match &self.original_xdg_config {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_collect_affected_profiles_zdotdir() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = AbsolutePathBuf::new(temp_dir.path().join("home")).unwrap();
+        let zdotdir = temp_dir.path().join("zdotdir");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&zdotdir).unwrap();
+
+        std::fs::write(zdotdir.join(".zshenv"), ". \"$HOME/.vite-plus/env\"\n").unwrap();
+
+        let _guard = ProfileEnvGuard::new(Some(&zdotdir), None);
+
+        let profiles = collect_affected_profiles(&home);
+        let zdotdir_profiles: Vec<_> =
+            profiles.iter().filter(|p| p.path.as_path().starts_with(&zdotdir)).collect();
+        assert_eq!(zdotdir_profiles.len(), 1);
+        assert!(matches!(&zdotdir_profiles[0].kind, AffectedProfileKind::Main { .. }));
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn test_collect_affected_profiles_xdg_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let home = AbsolutePathBuf::new(temp_dir.path().join("home")).unwrap();
+        let xdg_config = temp_dir.path().join("xdg_config");
+        let fish_dir = xdg_config.join("fish/conf.d");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&fish_dir).unwrap();
+
+        std::fs::write(fish_dir.join("vite-plus.fish"), "").unwrap();
+
+        let _guard = ProfileEnvGuard::new(None, Some(&xdg_config));
+
+        let profiles = collect_affected_profiles(&home);
+        let xdg_profiles: Vec<_> =
+            profiles.iter().filter(|p| p.path.as_path().starts_with(&xdg_config)).collect();
+        assert_eq!(xdg_profiles.len(), 1);
+        assert!(matches!(&xdg_profiles[0].kind, AffectedProfileKind::Snippet));
     }
 
     #[test]

@@ -302,9 +302,18 @@ async function mergePackageJson(pluginExports: Array<{ exportPath: string; shimF
     // browser-provider exports. Browser code uses index.js which is safe.
     // This separation prevents Node.js-only code (like __vite__injectQuery) from being
     // loaded in the browser, which would cause "Identifier already declared" errors.
+    //
+    // IMPORTANT: The 'browser' condition must come BEFORE 'node' because vitest passes
+    // custom --conditions (like 'browser') to worker processes when frameworks like Nuxt
+    // set edge/cloudflare presets. Without the 'browser' condition here, Node.js would
+    // match 'node' first, loading index-node.js which imports @vitest/browser/index.js,
+    // which imports 'ws'. With --conditions browser active, 'ws' resolves to its browser
+    // stub (ws/browser.js) that doesn't export WebSocketServer, causing a SyntaxError.
+    // See: https://github.com/voidzero-dev/vite-plus/issues/831
     if (destPkg.exports['.'] && destPkg.exports['.'].import) {
       destPkg.exports['.'].import = {
         types: destPkg.exports['.'].import.types,
+        browser: destPkg.exports['.'].import.default,
         node: './dist/index-node.js',
         default: destPkg.exports['.'].import.default,
       };
@@ -610,18 +619,23 @@ async function copyVitestPackages() {
     totalCopied += copied;
     console.log(`    -> ${copied} files`);
 
-    // Copy root type definition files if they exist
-    // These include context.d.ts (browser providers), matchers.d.ts (expect.element), jest-dom.d.ts (matchers)
-    const rootDtsFiles = ['context.d.ts', 'matchers.d.ts', 'jest-dom.d.ts'];
-    for (const dtsFile of rootDtsFiles) {
-      const rootDts = resolve(projectDir, `node_modules/${pkg}/${dtsFile}`);
+    // Copy root .d.ts files from @vitest/browser package directory.
+    // These are type definitions that live at the package root (not in dist/),
+    // e.g. context.d.ts, matchers.d.ts, aria-role.d.ts, utils.d.ts.
+    // Dynamically scan instead of hardcoding to handle future upstream additions.
+    if (pkg === '@vitest/browser') {
+      const pkgRoot = resolve(projectDir, `node_modules/${pkg}`);
       try {
-        await stat(rootDts);
-        await copyFile(rootDts, join(destPkgDir, dtsFile));
-        console.log(`    + copied ${dtsFile}`);
-        totalCopied++;
+        const pkgEntries = await readdir(pkgRoot);
+        for (const entry of pkgEntries) {
+          if (entry.endsWith('.d.ts')) {
+            await copyFile(join(pkgRoot, entry), join(destPkgDir, entry));
+            console.log(`    + copied ${entry}`);
+            totalCopied++;
+          }
+        }
       } catch {
-        // File doesn't exist, skip
+        // Package root not readable, skip
       }
     }
   }
@@ -1445,7 +1459,7 @@ async function patchVitestBrowserPackage() {
   // This allows imports like @vitest/runner to be resolved to our copied @vitest files
   const mappingEntries = Object.entries(VITEST_PACKAGE_TO_PATH)
     .filter(([pkg]) => pkg.startsWith('@vitest/'))
-    .map(([pkg, file]) => `'${pkg}': resolve(distRoot, '${file}')`)
+    .map(([pkg, file]) => `'${pkg}': resolve(packageRoot, '${file}')`)
     .join(',\n      ');
 
   // distRoot is @vitest/browser/ so we need to go up two levels to reach the actual dist root

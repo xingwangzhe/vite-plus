@@ -92,6 +92,71 @@ Finally, verify the migration by running: `vp install`, `vp check`, `vp test`, a
 Summarize the migration at the end and report any manual follow-up still required.
 ```
 
+## Tool-Specific Migrations
+
+### Vitest
+
+Vitest is automatically migrated through `vp migrate`. If you are migrating manually, you have to update all the imports to `vite-plus/test` instead:
+
+```ts
+// before
+import { describe, expect, it, vi } from 'vitest';
+
+const { page } = await import('@vitest/browser/context');
+
+// after
+import { describe, expect, it, vi } from 'vite-plus/test';
+
+const { page } = await import('vite-plus/test/browser/context');
+```
+
+### tsdown
+
+If your project uses a `tsdown.config.ts`, move its options into the `pack` block in `vite.config.ts`:
+
+```ts
+// before — tsdown.config.ts
+import { defineConfig } from 'tsdown';
+
+export default defineConfig({
+  entry: ['src/index.ts'],
+  dts: true,
+  format: ['esm', 'cjs'],
+});
+
+// after — vite.config.ts
+import { defineConfig } from 'vite-plus';
+
+export default defineConfig({
+  pack: {
+    entry: ['src/index.ts'],
+    dts: true,
+    format: ['esm', 'cjs'],
+  },
+});
+```
+
+After merging, delete `tsdown.config.ts`. See the [Pack guide](/guide/pack) for the full configuration reference.
+
+### lint-staged
+
+Vite+ replaces lint-staged with its own `staged` block in `vite.config.ts`. Only the `staged` config format is supported. Standalone `.lintstagedrc` in non-JSON format and `lint-staged.config.*` are not migrated automatically.
+
+Move your lint-staged rules into the `staged` block:
+
+```ts
+// vite.config.ts
+import { defineConfig } from 'vite-plus';
+
+export default defineConfig({
+  staged: {
+    '*.{js,ts,tsx,vue,svelte}': 'vp check --fix',
+  },
+});
+```
+
+After migrating, remove lint-staged from your dependencies and delete any lint-staged config files. See the [Commit hooks guide](/guide/commit-hooks) and [Staged config reference](/config/staged) for details.
+
 ## Examples
 
 ```bash
